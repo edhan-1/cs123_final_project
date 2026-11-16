@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+hailort*.log
+.lgd-nfy*

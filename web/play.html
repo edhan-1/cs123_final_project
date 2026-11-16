@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pupper: red light, green light</title>
+<!--
+The game page: Gemini Pupper's web app, unchanged, in a frame, with the FAST EAR
+in a bar above it. Open http://localhost:8000/play instead of http://localhost:8000.
+
+Why: Gemini needs a second or two to turn the words "green light" or "red light"
+into a tool call. The ear listens to the same microphone, right here in the
+browser, and tells the robot directly (POST /game/heard, see heard() in
+game/red_light_green_light.py). Gemini still hears everything; it is Pupper's
+voice, not the one that works the lights. The game can be played with Gemini
+asleep: the New game button starts one.
+
+The ear has two parts:
+  The word ear     the browser's own speech recognition (Google Chrome) listens
+                   for "green light" and "red light" and tells the robot at once.
+  The voice ear    the moment somebody starts to speak during a green light,
+                   Pupper holds still, before the words are even finished. If
+                   "red light" does not follow, it walks on after 3 s. Any voice
+                   or loud noise does it, so in a loud room use the words alone.
+"Freeze on" in the bar picks: any voice (both parts), the words (word ear only),
+or nothing (no ear: Gemini works the lights, as slowly as before).
+
+The robot only lets the ear change a light the right way round: a green light
+on red, a red light or a voice on green.
+-->
+<style>
+  :root { color-scheme: dark; }
+  html, body { height: 100%; margin: 0; background: #111418; color: #e8eaed;
+               font: 14px/1.3 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 8px 16px;
+         background: #1b2027; border-bottom: 1px solid #2c333d; }
+  label { display: flex; align-items: center; gap: 6px; color: #aab2bd; }
+  select, input, button { font: inherit; color: inherit; }
+  select, input[type=number], button { background: #111418; border: 1px solid #3a424d; border-radius: 6px; padding: 4px 8px; }
+  input[type=number] { width: 3.5em; }
+  input[type=range] { accent-color: #5fd38d; }
+  button { cursor: pointer; }
+  button:hover { border-color: #5fd38d; }
+  #meter { position: relative; width: 140px; height: 12px; background: #0c0e11; border: 1px solid #3a424d; border-radius: 6px; overflow: hidden; }
+  #level { position: absolute; inset: 0 auto 0 0; width: 0; background: #5fd38d; }
+  #level.loud { background: #ff6b5e; }
+  #mark { position: absolute; top: 0; bottom: 0; width: 2px; background: #e8eaed; }
+  #status { flex: 1 1 240px; min-width: 0; color: #aab2bd; }
+  #status.robot { color: #e8eaed; font-weight: 600; }
+  iframe { flex: 1; width: 100%; border: 0; background: #000; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <strong>Fast ear</strong>
+  <label>Freeze on
+    <select id="mode">
+      <option value="voice">any voice (fastest)</option>
+      <option value="words">the words "red light"</option>
+      <option value="off">nothing (Gemini only)</option>
+    </select>
+  </label>
+  <label id="tune">Sensitivity <input id="sens" type="range" min="0" max="100" step="1">
+    <span id="meter" title="How loud the microphone is now; the white line is the level that counts as a voice"><span id="level"></span><span id="mark"></span></span>
+  </label>
+  <label><button id="new">New game</button> <input id="distance" type="number" min="1" max="7" step="0.5" value="3"> m</label>
+  <span id="status">starting…</span>
+</div>
+<iframe id="app" src="/" allow="microphone; camera; autoplay; fullscreen" title="Gemini Pupper"></iframe>
+
+<script>
+const $ = id => document.getElementById(id);
+const saved = (key, fallback) => { try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; } };
+const save = (key, value) => { try { localStorage.setItem(key, value); } catch {} };
+
+let mode = saved('ear_mode', 'voice');
+
+// ------------------------------------------------------------ the status line
+let robotSaidUntil = 0;                          // while this lasts, the line shows the robot's last reply
+let voiceEar = 'off', wordEar = 'off', lastWords = '';
+
+function showStatus() {
+  if (performance.now() < robotSaidUntil) return;
+  $('status').className = '';
+  $('status').textContent = mode === 'off' ? 'off: only Gemini works the lights'
+    : (mode === 'voice' ? 'voice ear: ' + voiceEar + ' · ' : '') + 'word ear: ' + wordEar + (lastWords ? ' · heard "' + lastWords + '"' : '');
+}
+
+function showRobot(text) {
+  robotSaidUntil = performance.now() + 2500;
+  $('status').className = 'robot';
+  $('status').textContent = text;
+}
+
+// ------------------------------------------------------------ telling the robot
+async function post(path, body) {
+  const reply = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  return reply.json();
+}
+
+/** Tell the robot what the ear heard. The robot decides whether it counts. */
+async function tell(what) {
+  try {
+    const result = await post('/game/heard', { what });
+    if (what === 'listening') return;
+    if (result.success) showRobot(what + ' → ' + result.message);  // it changed something
+  } catch { showRobot('cannot reach the robot'); }
+}
+
+$('new').onclick = async () => {
+  try { showRobot((await post('/tools/start_game', { distance: Number($('distance').value) || 3 })).message); }
+  catch { showRobot('cannot reach the robot'); }
+};
+
+// ------------------------------------------------------------ Pupper's own voice
+// The word ear also hears the speaker. If Pupper says "say green light and I go",
+// that must not be a green light. The app in the frame plays every piece of
+// Pupper's voice with source.start(when): note when each piece ends.
+let pupperSpeaksUntil = -1e9;                    // performance.now() when Pupper's voice stops (long ago: not yet)
+const AFTER_PUPPER = 1000;                       // ms: the word ear reports what it heard a little late
+
+function watchPupperVoice(win) {
+  const proto = win.AudioBufferSourceNode && win.AudioBufferSourceNode.prototype;
+  if (!proto || proto.watched) return;
+  const start = proto.start;
+  proto.start = function (when = 0, ...rest) {
+    try {
+      const wait = Math.max(0, when - this.context.currentTime);
+      pupperSpeaksUntil = Math.max(pupperSpeaksUntil, performance.now() + (wait + (this.buffer ? this.buffer.duration : 0)) * 1000);
+    } catch {}
+    return start.call(this, when, ...rest);
+  };
+  proto.watched = true;
+}
+
+// ------------------------------------------------------------ the voice ear
+// How loud is the microphone, 50 times a second? Louder than the threshold for two
+// checks in a row (about 40 ms) counts as a voice. The threshold is the slider's
+// level, or three times the room's own noise, whichever is higher.
+let audio = null, analyser = null, samples = null;
+let floor = 0.003;                               // the room's noise level, tracked while nobody speaks
+let loudChecks = 0, lastVoice = 0;
+
+const threshold = () => Math.max(Math.pow(10, -0.7 - $('sens').value / 100 * 1.8), floor * 3);  // slider: 0.2 down to 0.003
+const meterPosition = level => Math.max(0, Math.min(1, (Math.log10(Math.max(level, 1e-4)) + 3) / 3)) * 100 + '%';
+
+async function startVoiceEar() {
+  if (audio) return;
+  let microphone;
+  try {
+    microphone = await navigator.mediaDevices.getUserMedia(
+      { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false } });
+  } catch (e) { voiceEar = 'no microphone (' + (e.message || e.name) + ')'; return showStatus(); }
+  audio = new AudioContext();
+  // Keep only the range a voice lives in, so footsteps and hum count for less.
+  const highpass = new BiquadFilterNode(audio, { type: 'highpass', frequency: 200 });
+  const lowpass = new BiquadFilterNode(audio, { type: 'lowpass', frequency: 3500 });
+  analyser = new AnalyserNode(audio, { fftSize: 1024 });  // about 20 ms of sound
+  audio.createMediaStreamSource(microphone).connect(highpass).connect(lowpass).connect(analyser);
+  samples = new Float32Array(analyser.fftSize);
+  setInterval(listen, 20);
+}
+
+function listen() {
+  if (mode !== 'voice' || !audio) return;
+  if (audio.state !== 'running') { voiceEar = 'click anywhere to turn it on'; return showStatus(); }
+  analyser.getFloatTimeDomainData(samples);
+  let sum = 0;
+  for (const x of samples) sum += x * x;
+  const level = Math.sqrt(sum / samples.length);
+  const limit = threshold();
+  const loud = level > limit;
+  loudChecks = loud ? loudChecks + 1 : 0;
+  floor += (level - floor) * (loud ? 0.002 : 0.02);  // follow the room; a noise that never ends becomes the room
+  if (loudChecks >= 2 && performance.now() - lastVoice > 250) { lastVoice = performance.now(); tell('voice'); }
+  $('level').style.width = meterPosition(level);
+  $('level').className = loud ? 'loud' : '';
+  $('mark').style.left = meterPosition(limit);
+  voiceEar = 'on';
+  showStatus();
+}
+
+// ------------------------------------------------------------ the word ear
+// The browser's own speech recognition: Chrome sends the sound to Google and gets
+// words back while you are still speaking, again and again for the same sentence
+// as it makes up its mind. So for each sentence we count how many "green light"s
+// and "red light"s are in it, and act only when a count goes up.
+const RED = /\bred\s*-?\s*li(ght|te)/g, GREEN = /\bgreen\s*-?\s*li(ght|te)/g;
+let recogniser = null, counted = [], retryIn = 300, gaveUp = false;
+
+function onWords(sentence, text) {
+  text = text.toLowerCase();
+  lastWords = text.trim().split(/\s+/).slice(-4).join(' ');
+  const reds = [...text.matchAll(RED)], greens = [...text.matchAll(GREEN)];
+  const before = counted[sentence] || { reds: 0, greens: 0 };
+  const newRed = reds.length > before.reds, newGreen = greens.length > before.greens;
+  counted[sentence] = { reds: Math.max(before.reds, reds.length), greens: Math.max(before.greens, greens.length) };
+  if (!newRed && !newGreen) return showStatus();
+  // Both new at once ("green light red light" in one breath): the later one is where the caller ended.
+  const lastRed = newRed ? reds.at(-1).index : -1, lastGreen = newGreen ? greens.at(-1).index : -1;
+  if (lastRed > lastGreen) tell('red light');  // stopping is always fine, whoever said it
+  else if (performance.now() < pupperSpeaksUntil + AFTER_PUPPER) showRobot('heard "green light", but that was Pupper talking: ignored');
+  else tell('green light');
+}
+
+function startWordEar() {
+  const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!Recognition) { wordEar = 'not in this browser (use Chrome): Gemini works the lights'; return showStatus(); }
+  if (recogniser || gaveUp) return;
+  const mine = recogniser = new Recognition();
+  mine.continuous = true;
+  mine.interimResults = true;
+  mine.lang = 'en-US';
+  mine.onstart = () => { counted = []; wordEar = 'on'; showStatus(); };
+  mine.onresult = event => {
+    for (let i = event.resultIndex; i < event.results.length; i++) onWords(i, event.results[i][0].transcript);
+  };
+  mine.onerror = event => {
+    if (event.error === 'no-speech' || event.error === 'aborted') return;  // silence: Chrome just starts over
+    wordEar = 'problem (' + event.error + '): Gemini works the lights';
+    gaveUp = ['not-allowed', 'service-not-allowed', 'language-not-supported'].includes(event.error);
+    retryIn = 3000;
+    showStatus();
+  };
+  mine.onend = () => {  // Chrome stops listening now and then: start again
+    if (recogniser !== mine) return;
+    recogniser = null;
+    if (!gaveUp && mode !== 'off') setTimeout(startWordEar, retryIn);
+    retryIn = 300;
+  };
+  try { mine.start(); } catch (e) { recogniser = null; wordEar = 'problem (' + e.message + ')'; showStatus(); }
+}
+
+function stopWordEar() {
+  const old = recogniser;
+  recogniser = null;
+  wordEar = 'off';
+  if (old) { try { old.stop(); } catch {} }
+}
+
+// While the word ear is on, the robot lets it give the green lights (Gemini's own
+// call comes too late to trust). Say so every 2 s; when the page closes, it stops.
+setInterval(() => { if (wordEar === 'on' && mode !== 'off') tell('listening'); }, 2000);
+
+// ------------------------------------------------------------ the bar
+function setMode(next) {
+  mode = next;
+  save('ear_mode', mode);
+  $('mode').value = mode;
+  $('tune').style.visibility = mode === 'voice' ? 'visible' : 'hidden';
+  if (mode === 'off') stopWordEar(); else { gaveUp = false; startWordEar(); }
+  if (mode === 'voice') startVoiceEar();
+  showStatus();
+}
+
+$('sens').value = saved('ear_sensitivity', '55');
+$('sens').oninput = () => save('ear_sensitivity', $('sens').value);
+$('mode').onchange = () => setMode($('mode').value);
+
+// A browser only lets a page use sound after a click. A click in the app below
+// (WAKE PUPPER) counts too.
+const wake = () => { if (audio && audio.state === 'suspended') audio.resume(); };
+document.addEventListener('click', wake, true);
+$('app').addEventListener('load', () => {
+  try {
+    $('app').contentWindow.document.addEventListener('click', wake, true);
+    watchPupperVoice($('app').contentWindow);
+  } catch {}
+});
+
+setMode(['voice', 'words', 'off'].includes(mode) ? mode : 'voice');
+</script>
+</body>
+</html>
