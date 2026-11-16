@@ -30,6 +30,7 @@ REPO = Path(__file__).resolve().parent.parent
 GAME_DIR = REPO / "game"
 PROMPT_FILE = GAME_DIR / "prompt.md"
 PLAY_PAGE = REPO / "web" / "play.html"
+EYE_PICTURE = Path("/tmp/gemini-pupper/eye.jpg")  # robot/eye.py writes what it sees here; the game server shows it
 GEMINI_PUPPER = Path(os.environ.get("GEMINI_PUPPER_DIR", REPO.parent / "gemini_pupper")).expanduser().resolve()
 
 

@@ -1,4 +1,4 @@
-// Checks for the fast ear's logic in play.html, without a browser:
+// Checks for the logic of play.html (the fast ear, and the bar), without a browser:
 //     node web/test_play.js
 // The page's script runs here with a stand-in page, microphone, speech recogniser
 // and robot. It checks what the ear tells the robot for what it hears. It cannot
@@ -13,6 +13,7 @@ const code = fs.readFileSync(path.join(__dirname, 'play.html'), 'utf8').match(/<
 const told = [];       // everything posted to the robot: [path, body]
 const ears = [];       // the speech recognisers the page started
 const timers = [];     // the page's setInterval callbacks
+let game = { phase: 'no game', lights: 'voice', message: 'no game is on', eye: 'not running' };  // what GET /game/status answers
 const elements = {};
 const element = id => elements[id] || (elements[id] = {
   style: {}, textContent: '', className: '', addEventListener() {},
@@ -22,6 +23,7 @@ global.document = { getElementById: element, addEventListener() {} };
 global.localStorage = { getItem: () => null, setItem() {} };
 global.navigator = { mediaDevices: { getUserMedia: async () => { throw new Error('no microphone here'); } } };
 global.fetch = async (where, options) => {
+  if (!options) return { json: async () => game };  // a GET: the page asks how the game stands
   told.push([where, JSON.parse(options.body)]);
   return { json: async () => ({ success: true, message: 'ok' }) };
 };
@@ -31,6 +33,7 @@ global.window = global;
 
 vm.runInThisContext(code + `
 ;globalThis.page = { watchPupperVoice, pupperTalksFor(ms) { pupperSpeaksUntil = performance.now() + ms; },
+                     robotReplyIsOld() { robotSaidUntil = 0; },  // the status line shows a reply for 2.5 s: skip the wait
                      get pupperSpeaksUntil() { return pupperSpeaksUntil; }, get wordEar() { return wordEar; } };`);
 
 // ---- helpers
@@ -100,7 +103,7 @@ async function chromeHears(index, text) {
   element('distance').value = '5';
   await element('new').onclick();
   check('New game starts a game with the distance in the box',
-        JSON.stringify(told.at(-1)) === JSON.stringify(['/tools/start_game', { distance: 5 }]), JSON.stringify(told.at(-1)));
+        JSON.stringify(told.at(-1)) === JSON.stringify(['/tools/start_game', { distance: 5, lights: 'voice' }]), JSON.stringify(told.at(-1)));
   element('mode').value = 'off';
   element('mode').onchange();
   const quiet = heard().length;
@@ -108,6 +111,37 @@ async function chromeHears(index, text) {
   await chromeHears(9, 'green light');
   await tick();
   check('"nothing" really is nothing: no "listening"', !heard().slice(quiet).includes('listening'), heard().slice(quiet).join());
+
+  console.log('Lights by camera');
+  element('mode').value = 'voice';
+  element('mode').onchange();  // the ear is on again
+  await tick();
+  game = { phase: 'red light', lights: 'camera', message: 'game on, lights by camera', eye: 'facing' };  // Gemini started a game by camera
+  page.robotReplyIsOld();
+  timers.forEach(fn => fn());
+  await tick();
+  check('the bar follows a game that was started by camera', element('lights').value === 'camera', element('lights').value);
+  check('... shows what the eye sees, and how the game stands',
+        /eye: facing/.test(element('status').textContent) && /by camera/.test(element('status').textContent), element('status').textContent);
+  check('... and fetches the picture the eye looked at', /^\/game\/eye\.jpg/.test(element('eye').src || ''), element('eye').src);
+  const before2 = heard().length;
+  timers.forEach(fn => fn());
+  await tick();
+  check('by camera the ear is off: no "listening"', !heard().slice(before2).includes('listening'), heard().slice(before2).join());
+  await element('new').onclick();
+  check('New game starts a game by camera',
+        JSON.stringify(told.at(-1)) === JSON.stringify(['/tools/start_game', { distance: 5, lights: 'camera' }]), JSON.stringify(told.at(-1)));
+  game = { phase: 'no game', lights: 'voice', message: 'no game is on', eye: 'unsure' };  // the game ended
+  timers.forEach(fn => fn());
+  await tick();
+  check('with no game on, the bar stays where you put it', element('lights').value === 'camera', element('lights').value);
+  element('lights').value = 'voice';
+  element('lights').onchange();
+  await tick();
+  const before3 = heard().length;
+  timers.forEach(fn => fn());
+  await tick();
+  check('back to voice: the word ear listens again', heard().slice(before3).includes('listening'), heard().slice(before3).join());
 
   console.log(failed ? `\n${failed} check(s) failed, ${passed} passed.` : `\nAll ${passed} checks passed.`);
   process.exit(failed ? 1 : 0);

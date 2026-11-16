@@ -27,6 +27,13 @@ or nothing (no ear: Gemini works the lights, as slowly as before).
 
 The robot only lets the ear change a light the right way round: a green light
 on red, a red light or a voice on green.
+
+"Lights" in the bar picks how the next game is played. By voice: the ear, as
+above. By camera: the caller turns their back for green and faces Pupper for
+red. Then the ear is off and the lights are worked by the eye, a program on the
+robot (robot/eye.py) that watches the caller with Pupper's camera. The eye is
+not in this page: the page only shows the picture the eye looks at and what it
+made of it, so that you can check it.
 -->
 <style>
   :root { color-scheme: dark; }
@@ -48,13 +55,20 @@ on red, a red light or a voice on green.
   #mark { position: absolute; top: 0; bottom: 0; width: 2px; background: #e8eaed; }
   #status { flex: 1 1 240px; min-width: 0; color: #aab2bd; }
   #status.robot { color: #e8eaed; font-weight: 600; }
+  #eye { height: 96px; width: 96px; border: 1px solid #3a424d; border-radius: 6px; background: #0c0e11; }
+  #eye:hover { height: 320px; width: 320px; }
   iframe { flex: 1; width: 100%; border: 0; background: #000; }
 </style>
 </head>
 <body>
 <div id="bar">
-  <strong>Fast ear</strong>
-  <label>Freeze on
+  <label><strong>Lights</strong>
+    <select id="lights">
+      <option value="voice">by voice: say "green light", "red light"</option>
+      <option value="camera">by camera: turn your back, face Pupper</option>
+    </select>
+  </label>
+  <label id="ear">Freeze on
     <select id="mode">
       <option value="voice">any voice (fastest)</option>
       <option value="words">the words "red light"</option>
@@ -64,6 +78,7 @@ on red, a red light or a voice on green.
   <label id="tune">Sensitivity <input id="sens" type="range" min="0" max="100" step="1">
     <span id="meter" title="How loud the microphone is now; the white line is the level that counts as a voice"><span id="level"></span><span id="mark"></span></span>
   </label>
+  <img id="eye" alt="what the eye sees" title="What Pupper's eye sees (point at it to enlarge). The caller stands between the two lines.">
   <label><button id="new">New game</button> <input id="distance" type="number" min="1" max="7" step="0.5" value="3"> m</label>
   <span id="status">starting…</span>
 </div>
@@ -74,16 +89,20 @@ const $ = id => document.getElementById(id);
 const saved = (key, fallback) => { try { return localStorage.getItem(key) ?? fallback; } catch { return fallback; } };
 const save = (key, value) => { try { localStorage.setItem(key, value); } catch {} };
 
-let mode = saved('ear_mode', 'voice');
+let mode = saved('ear_mode', 'voice');             // what the ear freezes on: 'voice', 'words' or 'off'
+let lights = saved('lights', 'voice');           // who calls the lights: 'voice' (the ear) or 'camera' (the robot's eye)
+const ear = () => lights === 'camera' ? 'off' : mode;  // by camera the ear has nothing to do
 
 // ------------------------------------------------------------ the status line
 let robotSaidUntil = 0;                          // while this lasts, the line shows the robot's last reply
 let voiceEar = 'off', wordEar = 'off', lastWords = '';
+let eyeSees = '', gameSays = '';                 // by camera: what the robot's eye sees, and how the game stands
 
 function showStatus() {
   if (performance.now() < robotSaidUntil) return;
   $('status').className = '';
-  $('status').textContent = mode === 'off' ? 'off: only Gemini works the lights'
+  $('status').textContent = lights === 'camera' ? 'eye: ' + (eyeSees || '…') + (gameSays ? ' · ' + gameSays : '')
+    : mode === 'off' ? 'off: only Gemini works the lights'
     : (mode === 'voice' ? 'voice ear: ' + voiceEar + ' · ' : '') + 'word ear: ' + wordEar + (lastWords ? ' · heard "' + lastWords + '"' : '');
 }
 
@@ -109,9 +128,26 @@ async function tell(what) {
 }
 
 $('new').onclick = async () => {
-  try { showRobot((await post('/tools/start_game', { distance: Number($('distance').value) || 3 })).message); }
+  try { showRobot((await post('/tools/start_game', { distance: Number($('distance').value) || 3, lights })).message); }
   catch { showRobot('cannot reach the robot'); }
 };
+
+// ------------------------------------------------------------ the eye (a game by camera)
+// Twice a second, ask the robot how the game stands. If a game is on, the bar
+// follows it: Gemini may have started one by camera while the bar said voice.
+// By camera, also fetch the picture the eye last looked at.
+async function watchGame() {
+  let game;
+  try { game = await (await fetch('/game/status')).json(); } catch { return; }
+  const playing = game.phase === 'red light' || game.phase === 'green light';
+  if (playing && game.lights !== lights) setLights(game.lights);
+  eyeSees = game.eye;
+  gameSays = game.message;
+  if (lights !== 'camera') return;
+  $('eye').src = '/game/eye.jpg?' + Date.now();  // a new address each time, so the browser fetches it again
+  showStatus();
+}
+setInterval(watchGame, 500);
 
 // ------------------------------------------------------------ Pupper's own voice
 // The word ear also hears the speaker. If Pupper says "say green light and I go",
@@ -163,7 +199,7 @@ async function startVoiceEar() {
 }
 
 function listen() {
-  if (mode !== 'voice' || !audio) return;
+  if (ear() !== 'voice' || !audio) return;
   if (audio.state !== 'running') { voiceEar = 'click anywhere to turn it on'; return showStatus(); }
   analyser.getFloatTimeDomainData(samples);
   let sum = 0;
@@ -226,7 +262,7 @@ function startWordEar() {
   mine.onend = () => {  // Chrome stops listening now and then: start again
     if (recogniser !== mine) return;
     recogniser = null;
-    if (!gaveUp && mode !== 'off') setTimeout(startWordEar, retryIn);
+    if (!gaveUp && ear() !== 'off') setTimeout(startWordEar, retryIn);
     retryIn = 300;
   };
   try { mine.start(); } catch (e) { recogniser = null; wordEar = 'problem (' + e.message + ')'; showStatus(); }
@@ -241,22 +277,36 @@ function stopWordEar() {
 
 // While the word ear is on, the robot lets it give the green lights (Gemini's own
 // call comes too late to trust). Say so every 2 s; when the page closes, it stops.
-setInterval(() => { if (wordEar === 'on' && mode !== 'off') tell('listening'); }, 2000);
+setInterval(() => { if (wordEar === 'on' && ear() !== 'off') tell('listening'); }, 2000);
 
 // ------------------------------------------------------------ the bar
+function showBar() {  // make the bar and the ears match `lights` and `mode`
+  $('lights').value = lights;
+  $('mode').value = mode;
+  $('ear').style.display = $('tune').style.display = lights === 'voice' ? '' : 'none';  // the ear's controls
+  $('eye').style.display = lights === 'camera' ? '' : 'none';                           // the eye's picture
+  $('tune').style.visibility = mode === 'voice' ? 'visible' : 'hidden';
+  if (ear() === 'off') stopWordEar(); else { gaveUp = false; startWordEar(); }
+  if (ear() === 'voice') startVoiceEar();
+  showStatus();
+}
+
 function setMode(next) {
   mode = next;
   save('ear_mode', mode);
-  $('mode').value = mode;
-  $('tune').style.visibility = mode === 'voice' ? 'visible' : 'hidden';
-  if (mode === 'off') stopWordEar(); else { gaveUp = false; startWordEar(); }
-  if (mode === 'voice') startVoiceEar();
-  showStatus();
+  showBar();
+}
+
+function setLights(next) {
+  lights = next;
+  save('lights', lights);
+  showBar();
 }
 
 $('sens').value = saved('ear_sensitivity', '55');
 $('sens').oninput = () => save('ear_sensitivity', $('sens').value);
 $('mode').onchange = () => setMode($('mode').value);
+$('lights').onchange = () => setLights($('lights').value);
 
 // A browser only lets a page use sound after a click. A click in the app below
 // (WAKE PUPPER) counts too.
@@ -269,6 +319,7 @@ $('app').addEventListener('load', () => {
   } catch {}
 });
 
+if (!['voice', 'camera'].includes(lights)) lights = 'voice';
 setMode(['voice', 'words', 'off'].includes(mode) ? mode : 'voice');
 </script>
 </body>

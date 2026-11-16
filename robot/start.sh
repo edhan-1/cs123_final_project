@@ -2,14 +2,21 @@
 # Start red light, green light on the robot. PUPPER STANDS UP AND WALKS when the
 # game is played: on the ground, clear floor ahead, a hand near the e-stop
 # (press the gamepad's right stick).
-#   robot/start.sh            robot stack + game server (use from a laptop through an SSH tunnel)
+#   robot/start.sh            robot stack + game server + eye (use from a laptop through an SSH tunnel)
 #   robot/start.sh --kiosk    also show the app full-screen on the robot's own screen. Our Pupper
 #                             has no microphone and the kiosk has no fast ear: play from a laptop.
 # Stop everything with robot/stop.sh.
 #
-# This is gemini_pupper/robot/start.sh with one change: step 2 starts
+# This is gemini_pupper/robot/start.sh with two changes. Step 2 starts
 # robot/game_server.py (the game's tools, prompt and page) instead of gemini_pupper's
-# server.py. The robot stack, the web app and the kiosk are gemini_pupper's own.
+# server.py, and then robot/eye.py, which watches the caller in a game by camera.
+# The robot stack, the web app and the kiosk are gemini_pupper's own.
+#
+# The eye needs the Hailo, and one program holds the Hailo at a time. The robot
+# stack's own person detector would hold it all day. So we point the stack at our
+# lab 5 follower instead (FOLLOW_ME_DIR, see person_follower in gemini_pupper's
+# launch file): it only takes the Hailo while Pupper follows somebody, which
+# never happens in the game. This also keeps the Pi much cooler.
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd); REPO=$(dirname "$HERE")
 GP=${GEMINI_PUPPER_DIR:-$(dirname "$REPO")/gemini_pupper}
@@ -21,6 +28,7 @@ free_port() {  # stop whatever is serving port 8000 (an older robot server)
   [ -n "$pids" ] && kill $pids 2>/dev/null && sleep 1
   return 0
 }
+export FOLLOW_ME_DIR=${FOLLOW_ME_DIR:-$(dirname "$REPO")/follow_me_pupper}
 ROS="source /opt/ros/jazzy/setup.bash; source $HOME/pupperv3-monorepo/ros2_ws/install/local_setup.bash; export ROS_LOCALHOST_ONLY=1"
 
 [ -f "$GP/robot/server.py" ] || { echo "Can't find gemini_pupper at $GP: clone it next to this repo, or set GEMINI_PUPPER_DIR"; exit 1; }
@@ -31,7 +39,11 @@ fi
 
 if pgrep -f "[r]os2_control_node" >/dev/null; then
   echo "[1/3] robot stack already running"
+  pgrep -f "[h]ailo_detection" >/dev/null && echo "      its person detector holds the Hailo, so the eye cannot start and games" \
+    "by camera are refused. For those: robot/stop.sh, then robot/start.sh again."
 else
+  [ -f "$FOLLOW_ME_DIR/robot/follow_service.py" ] || echo "      no lab 5 follower at $FOLLOW_ME_DIR: the stack's own" \
+    "person detector will hold the Hailo, and games by camera will be refused"
   echo "[1/3] starting robot stack (about a minute; log $LOG/robot.log)"
   rm -f $LOG/controllers_ready
   setsid nohup bash -c "$ROS; exec ros2 launch $GP/robot/launch/gemini_pupper.launch.py" > $LOG/robot.log 2>&1 < /dev/null &
@@ -46,6 +58,9 @@ pkill -f "[r]obot/server.py" 2>/dev/null; pkill -f "[r]obot/game_server.py" 2>/d
 setsid nohup bash -c "$ROS; cd $HERE && exec python3 -u $HERE/game_server.py" > $LOG/server.log 2>&1 < /dev/null &
 for i in $(seq 1 30); do curl -s -o /dev/null localhost:8000/health && break; sleep 1; done
 curl -s -o /dev/null localhost:8000/health || { echo "game server did not start; see $LOG/server.log"; exit 1; }
+echo "      starting the eye (log $LOG/eye.log)"
+pkill -f "[r]obot/eye.py" 2>/dev/null; rm -f $LOG/eye.jpg
+setsid nohup bash -c "$ROS; cd $HERE && exec python3 -u $HERE/eye.py" > $LOG/eye.log 2>&1 < /dev/null &
 
 if [ $KIOSK = 0 ]; then
   echo "[3/3] ready. From a laptop:  ssh -N -L 8000:localhost:8000 pi@<pupper>  then open http://localhost:8000/play in Chrome"

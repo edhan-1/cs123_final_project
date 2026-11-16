@@ -22,6 +22,7 @@ flowchart TB
     end
     subgraph Pi["Raspberry Pi on the robot"]
         Server["Game server, port 8000<br/>robot/game_server.py"]
+        Eye["The eye: robot/eye.py<br/>pose model on the Hailo"]
         Tools["Tools and the game's rules<br/>gemini_pupper/lab/ + game/"]
         API["Robot API: robot_api.py<br/>job queue, state, falls, e-stop"]
         Mux["cmd_vel_mux<br/>joystick > our code > person follower"]
@@ -33,6 +34,8 @@ flowchart TB
     App <-->|audio, camera frames, tool calls| Gemini
     App -->|"POST /tools/name (slow path, 1 to 2 s)"| Server
     Ear -->|"POST /game/heard (fast path)"| Server
+    HW -->|camera pictures| Eye
+    Eye -->|"POST /game/saw (10 a second, by camera)"| Server
     Server --> Tools --> API
     API -->|/llm_cmd_vel speeds, 20 Hz| Mux -->|/cmd_vel| Ctl
     API -->|switch controller| Ctl
@@ -47,17 +50,20 @@ flowchart TB
 | Seeing | The camera publishes `/camera/image_raw/compressed`. YOLO on the Hailo finds people; a state machine turns "where is the person" into speeds. | `follow_me_pupper` |
 | Tools | Python functions Gemini can call, and the checks that make them safe. A queue runs them one at a time. | `gemini_pupper` (lab 6) |
 | Brain | Gemini Live, reached from the browser. It hears, sees and talks, and it can only act by calling a tool. | `gemini_pupper` |
-| The game | The rules of red light, green light on top of the tools, and a page that hears the lights faster than Gemini can. | this repo |
+| The game | The rules of red light, green light on top of the tools, a page that hears the lights faster than Gemini can, and an eye that sees which way the caller is turned. | this repo |
 
 ## Who does what in the game
 
 Gemini was the whole brain in lab 6. In this game it turned out too slow for the
-one thing that has to be quick, so the work is split three ways:
+one thing that has to be quick, so the work is split. A game is played by voice
+or by camera (`start_game`'s `lights`); the ear works the lights in the first,
+the eye in the second:
 
 | Part | Where it runs | Its job |
 | --- | --- | --- |
 | **Gemini** | the cloud, through the web app | Pupper's voice and personality. Understands free speech: starts and ends games, takes the course length, answers "did you make it?", plays a victory trick. Works the lights only when the ear is not there. |
 | **The fast ear** (`web/play.html`) | the browser, next to the app | Works the lights. The *word ear* (the browser's speech recognition) hears "green light" and "red light". The *voice ear* (how loud is the microphone) freezes Pupper at the first sound of a voice. |
+| **The eye** (`robot/eye.py`) | the robot, next to the game server | Works the lights in a game by camera. Finds the caller in the camera picture and reports `back`, `facing` or `unsure`, about ten times a second. |
 | **The game's rules** (`game/red_light_green_light.py`) | the robot | Decides what counts. Keeps the score sheet, and refuses anything that would move Pupper on red, whoever asks. |
 
 ## Rules that follow from this design
@@ -89,8 +95,12 @@ one thing that has to be quick, so the work is split three ways:
   browser. Robot code sees HTTP requests, not sound: tool calls from Gemini, and
   what the ear heard. Anything that reacts to sound has to run in the page.
 - **Stopping is always allowed; starting has to be earned.** A stop is accepted
-  from anyone at any time. A walk is only accepted when the rules say so, and
-  only the words "green light" can start one: a noise never can.
+  from anyone at any time. A walk is only accepted when the rules say so. By
+  voice, only the words "green light" can start one: a noise never can. By
+  camera, only a turn can: the eye saw the caller's face, and then their back.
+- **One program holds the Hailo.** The eye needs it for the pose model, so
+  `robot/start.sh` starts the stack with our lab 5 follower (it takes the Hailo
+  only while following) instead of the stack's always-on person detector.
 - **Units and directions.** Metres, seconds, degrees. `+x` is forward, `+y` is
   left, and a positive turn is to the left (counter-clockwise).
 
@@ -172,6 +182,49 @@ Four things keep the fast path honest:
    that cannot recognise words, and within 5 s the robot lets Gemini work the
    lights again, slowly, as before.
 
+## A third path: the eye, in a game by camera
+
+The camera is on the robot, so the eye is too. It does not go through the
+browser or Gemini at all:
+
+```mermaid
+sequenceDiagram
+    actor Person
+    participant Eye as The eye (robot/eye.py)
+    participant Server as Game server (port 8000)
+    participant Game as The game (green light's job)
+    Note over Person: faces Pupper
+    Eye->>Server: POST /game/saw {"what": "facing"}
+    Note over Game: red, and now the caller has been seen facing Pupper
+    Note over Person: turns their back
+    Eye->>Server: "back", "back", "back", ... (10 a second)
+    Server->>Game: saw(): a back for 0.5 s without a break, so green_light()
+    Note over Game: Pupper walks, as long as "back" keeps arriving
+    Note over Person: starts to turn around: side-on
+    Eye->>Server: "unsure"
+    Server->>Game: saw(): send speed 0. The light is still green.
+    Note over Person: faces Pupper
+    Eye->>Server: "facing"
+    Server->>Game: saw(): red_light()
+```
+
+For one look the eye does four things: take the newest camera picture, cut out
+the part straight ahead and flatten it (`View`), run the pose model on it
+(`robot/pose.py`: 17 keypoints per person, each with a score), and turn the
+caller's keypoints into a word (`looks`). On the Pi one look takes about 60 ms.
+
+Four things keep this path honest:
+
+1. **The robot decides what counts.** The eye only reports, like the ear.
+2. **A green light needs a turn.** `facing` first, then `back` for 0.5 s. So a
+   thing that only looks like a back cannot start Pupper, and after any stop
+   (the stop tool, the e-stop, 6 s of walking) the caller turns once more.
+3. **Walking is a stream of `back`s.** The same idea as `cmd_vel_mux`: the game
+   forgets a `back` after 0.5 s. If the eye crashes or the camera freezes,
+   Pupper stands still.
+4. **`back` has to be sure; `facing` does not.** `facing` needs one clue (a
+   face, or the shoulders the front way round), `back` needs both.
+
 ## The game's state
 
 `Game`, in `game/red_light_green_light.py`, is the score sheet: the phase, the
@@ -209,6 +262,20 @@ stateDiagram-v2
 | end the game | `end_game` | | |
 
 While a game is on, the lab's `move`, `turn` and `play_trick` are refused.
+
+In a game by camera the phases are the same, and the eye takes the ear's place:
+
+| Change | Gemini (a tool) | The eye (`POST /game/saw`) | The robot, by itself |
+| --- | --- | --- | --- |
+| start a game | `start_game` with `lights: "camera"`, only while the eye is running | (the New game button posts the same) | |
+| red to green | (`green_light` is refused) | `"back"` for 0.5 s, after a `"facing"` | |
+| walking to holding | | `"unsure"` | 0.5 s without a report |
+| holding to walking | | `"back"` | |
+| green to red | `red_light`, `stop` | `"facing"` | the gamepad e-stop, a fall, 6 s with no red light |
+| green to finished, end the game | as by voice | | |
+
+The ear's words "red light" still stop Pupper in a game by camera; its "green
+light" and a voice do nothing there.
 
 ## How to use each part
 
@@ -265,11 +332,23 @@ tool call is too slow, the page can watch for the event itself and post it:
 Keep the direction rule: an event that stops Pupper can be trigger-happy, an
 event that moves it must not be.
 
+**Seeing something** (something the camera tells the robot). The same three
+steps, on the robot instead of in the page:
+
+1. In `robot/eye.py`, `looks()` turns one person's keypoints into a word, and
+   `see()` picks whose word counts. `python3 robot/eye.py --image frame.jpg`
+   shows every score it used for one saved picture.
+2. In `saw()` in `game/red_light_green_light.py`, decide what the word does.
+3. `POST /game/saw` in `robot/game_server.py` passes the word through. Add
+   checks to `game/test.py` (it has made-up people for `looks`, and `look()` to
+   report a word for a while).
+
 **The prompt** (`game/prompt.md`) is who Pupper is and how it plays. It is sent
 to Gemini when the app connects.
 
 **The game server** (`robot/game_server.py`, port 8000) is the only door into
-the robot. It is `gemini_pupper/robot/server.py` with two addresses added:
+the robot. It is `gemini_pupper/robot/server.py` with five addresses added (`/play` and the
+four that start with `/game`):
 
 | Address | What it does |
 | --- | --- |
@@ -278,18 +357,23 @@ the robot. It is `gemini_pupper/robot/server.py` with two addresses added:
 | `GET /tools` | the prompt and the tool list, for the app to hand to Gemini |
 | `POST /tools/<name>` | run a tool. Gemini's calls arrive here; so do `chat.py --robot` and the New game button |
 | `POST /game/heard` | what the ear heard: `{"what": "voice"}`, `"red light"`, `"green light"` or `"listening"` |
+| `POST /game/saw` | what the eye sees: `{"what": "back"}`, `"facing"` or `"unsure"`. The reply also says whether a game by camera is on, so the eye knows how often to look |
+| `GET /game/status` | the phase, who calls the lights, `game_status` in words, and the eye's last word. The page asks twice a second; it changes nothing |
+| `GET /game/eye.jpg` | the picture the eye last looked at, with the caller's box, the points and the word drawn in |
 | `GET /camera/image`, `GET /system/mode`, `POST /stop/immediate` | a camera frame, the robot's state in words, stop now |
 
 `PORT=8001 python3 robot/game_server.py --fake` runs the same server on a fake
 robot, next to the real one: for trying the page at a desk.
 
-**Vision of our own** (for later steps). Subscribe to
-`/camera/image_raw/compressed` in a ROS node, or reuse the detector from
-`follow_me_pupper/robot/` (YOLOv8 on the Hailo). The Hailo is held by one
-process at a time. The stack's "follow me" service uses our lab 5 follower only
-if it finds the repo at `~/follow_me_pupper` or `$FOLLOW_ME_DIR`; ours is at
-`~/labs/follow_me_pupper`, so it falls back to the monorepo's person detector,
-which runs all the time (see the last table).
+**Vision of our own.** `robot/eye.py` is the pattern: a program of its own that
+subscribes to `/camera/image_raw/compressed`, runs a model on the Hailo
+(`robot/pose.py`, written like lab 5's `yolo_seg.py`), and posts what it sees to
+the game server. It is a separate program so that slow picture work can never
+hold up the server, and with it the stop tool. The Hailo is held by one process
+at a time. The stack's "follow me" service uses our lab 5 follower only if it
+finds the repo at `~/follow_me_pupper` or `$FOLLOW_ME_DIR`, and otherwise the
+monorepo's person detector, which holds the Hailo all the time. So
+`robot/start.sh` sets `FOLLOW_ME_DIR` to `~/labs/follow_me_pupper`.
 
 ## How this project plugs in
 
@@ -300,7 +384,7 @@ then adds our tools, our prompt and our page:
 cs123_final_project/                       gemini_pupper/  (borrowed, not edited)
 ├── game/                                  ├── robot/server.py         the app + HTTP API
 │   ├── red_light_green_light.py  ───────► ├── robot/tool_registry.py  @tool, Param
-│   │     the rules, the tools, heard()    ├── robot/robot_api.py      queue, state, e-stop
+│   │     rules, tools, heard(), saw()     ├── robot/robot_api.py      queue, state, e-stop
 │   ├── prompt.md                          ├── robot/test_tools.py     the fake robot
 │   ├── test.py   (fake robot)             ├── robot/gemini_chat.py    Gemini in text
 │   └── chat.py   (Gemini in text)         ├── robot/launch/           the robot stack
@@ -309,8 +393,10 @@ cs123_final_project/                       gemini_pupper/  (borrowed, not edited
 │   └── test_play.js  its checks (node)
 └── robot/
     ├── bootstrap.py     finds gemini_pupper, loads the game
-    ├── game_server.py   server.py + the game, /play, /game/heard, --fake
-    └── start.sh, stop.sh
+    ├── game_server.py   server.py + the game, /play, /game/..., --fake
+    ├── eye.py           the eye: camera picture -> "back", "facing", "unsure"
+    ├── pose.py          the pose model on the Hailo: people and their keypoints
+    └── start.sh, stop.sh    (start.sh also starts the eye)
 ```
 
 Gemini gets the five game tools (`start_game`, `green_light`, `red_light`,
@@ -326,12 +412,15 @@ bottom of `game/red_light_green_light.py`.
 | `game/prompt.md` | `python3 game/chat.py`, then reconnect in the app (no restart) |
 | `web/play.html` | `node web/test_play.js`, then reload the page (no restart) |
 | `robot/game_server.py` | `robot/stop.sh && robot/start.sh` |
+| `robot/eye.py`, `robot/pose.py` | `python3 game/test.py`, then `python3 robot/eye.py --image <a saved camera picture>` (it needs the Hailo, so the eye must not be running), then `robot/stop.sh && robot/start.sh` |
 | a file in `gemini_pupper/lab/` | that repo's `python3 lab/test.py`, then ours, then restart |
 
 Three ways to try things with nothing moving: `game/test.py` (fake robot, fake
 time), `game/chat.py` (Gemini in text, fake robot in real time; it has no ear,
-so there Gemini works the lights), and `game_server.py --fake` (the real page
-and your real voice, on a fake robot).
+so there Gemini works the lights, and no eye, so a game by camera is refused),
+and `game_server.py --fake` (the real page and your real voice, on a fake
+robot). For a game by camera on the fake robot, be the eye yourself:
+`python3 robot/eye.py --pretend --server http://localhost:8001`.
 
 ## When something is wrong
 
@@ -344,7 +433,11 @@ and your real voice, on a fake robot).
 | Pupper freezes at every noise | Turn **Sensitivity** down until the white line sits above the room's noise, or set **Freeze on** to the words. |
 | Pupper does not freeze until the words are finished | **Freeze on** is set to the words, or the voice ear says `click anywhere to turn it on`. |
 | Pupper stops a moment after a green light | Gemini's late `red_light` for the red light before it (two calls within about 2 s), or the voice ear heard something. `server.log` shows which. |
+| "Pupper's eye is not running" when starting a game by camera | `/tmp/gemini-pupper/eye.log`. If it says it cannot use the Hailo, another program holds it (`pgrep -af hailo_detection`): the stack was started without `robot/start.sh`. `robot/stop.sh`, then `robot/start.sh`. |
+| By camera, Pupper never starts | The picture in the bar. Are you between the two lines, with a box around you? Does it say `facing` when you look at Pupper, and `back` when you turn? It needs `facing` once before every run. The points and scores for one picture: `robot/eye.py --image`. |
+| By camera, Pupper stutters while it walks | The eye says `unsure` now and then (`eye.log` shows each change). A shaking picture, or you are near the edge of the view or too close. |
+| By camera, Pupper is slow to freeze | The eye says `back` or `unsure` for too long while you turn. `looks()` in `robot/eye.py` decides; lowering `SURE` makes `facing` come sooner. |
 | Pupper refuses to move after a tumble | it is in `fallen`: set it upright and still, then ask it to stand up |
 | Kiosk screen never wakes | `/tmp/gemini-pupper/kiosk.log`, `chromium.log`; the key in `~/.config/gemini-pupper/api_key`. The kiosk shows `/` (no ear), and our Pupper has no microphone, so play from a laptop. |
-| The Pi is hot or sluggish | With the stack up we saw a load of about 8 on its 4 cores, mostly the camera and the monorepo's person detector (`hailo_detection`), which the game does not use. The launch file says it starts lab 5's quieter follower instead when it finds it: `FOLLOW_ME_DIR=~/labs/follow_me_pupper robot/start.sh`. We have not tried that yet. |
+| The Pi is hot or sluggish | With the monorepo's person detector (`hailo_detection`) running we saw a load of about 8 on its 4 cores and 81 °C. `robot/start.sh` now starts lab 5's quieter follower instead (`FOLLOW_ME_DIR`); check with `pgrep -af hailo_detection` that the detector is gone. The eye takes about 4 % of one core between games and 40 % during a game by camera. `vcgencmd measure_temp` shows the temperature. |
 | What is each controller doing | `ros2 control list_controllers` |
